@@ -1,284 +1,518 @@
-import { McpServer } from "@modelcontextprotocol/server";
-import { createMcpHandler } from "agents/mcp/server";
+import { WorkerEntrypoint } from "cloudflare:workers";
 import {
-  OAuthResourceServer,
-  type AuthorizationServerBinding,
+  OAuthAuthorizationServer,
+  type AuthRequest,
 } from "@cloudflare/workers-oauth-provider";
-import { z } from "zod";
+
+interface Env {
+  OAUTH_KV: KVNamespace;
+  GITHUB_CLIENT_ID: string;
+  GITHUB_CLIENT_SECRET: string;
+  COOKIE_ENCRYPTION_KEY: string;
+}
 
 type AuthProps = {
   githubLogin: string;
 };
 
-interface Env {
-  AUTH_SERVER: AuthorizationServerBinding<AuthProps>;
-  WORDPRESS_PUBLISHER_API_KEY: string;
-  PUBLISHER_API_KEY: string;
-}
-
-const MCP_RESOURCE =
-  "https://mlb-wordpress-mcp-v2.t-haruka-1203.workers.dev/mcp";
-
 const AUTH_ISSUER =
   "https://mlb-wordpress-auth.t-haruka-1203.workers.dev";
 
-const PUBLISHER_URL =
-  "https://mlb-wordpress-publisher.t-haruka-1203.workers.dev";
+const MCP_RESOURCE =
+  "https://mlb-wordpress-mcp.t-haruka-1203.workers.dev/mcp";
 
-function createServer(env: Env) {
-  const server = new McpServer({
-    name: "mlb-wordpress-mcp-v2",
-    version: "2.0.0",
+const MCP_RESOURCE_V2 =
+  "https://mlb-wordpress-mcp-v2.t-haruka-1203.workers.dev/mcp";
+
+const authorizationServer =
+  new OAuthAuthorizationServer<Env>({
+    issuer: AUTH_ISSUER,
+
+    resources: [
+      MCP_RESOURCE,
+      MCP_RESOURCE_V2,
+    ],
+
+    scopesSupported: [
+      "mcp:read",
+      "mcp:write",
+    ],
+
+    clientIdMetadataDocumentEnabled: true,
   });
 
-  server.registerTool(
-    "publisher_runtime_probe_v2",
-    {
-      description:
-        "Check the v2 MCP runtime and publisher secret bindings. " +
-        "This tool does not create a WordPress post.",
-      inputSchema: {},
-    },
-    async () => ({
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(
-            {
-              server: "mlb-wordpress-mcp-v2",
-              build: "2026-10-05-v2",
-              wordpress_publisher_api_key_configured:
-                Boolean(
-                  env.WORDPRESS_PUBLISHER_API_KEY
-                ),
-              publisher_api_key_configured:
-                Boolean(
-                  env.PUBLISHER_API_KEY
-                ),
-              mode: "draft-only",
-            },
-            null,
-            2
-          ),
-        },
-      ],
-    })
+function escapeHtml(
+  value: string
+): string {
+  return value.replace(
+    /[&<>"']/g,
+    (char) => {
+      const map:
+        Record<string, string> = {
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#039;",
+        };
+
+      return map[char] ?? char;
+    }
   );
+}
 
-  server.registerTool(
-    "create_wordpress_draft",
+function createConsentPage(
+  clientName: string,
+  scopes: string[],
+  handle: string
+): string {
+  const scopeHtml = scopes
+    .map(
+      (scope) => `
+        <label>
+          <input
+            type="checkbox"
+            name="scope"
+            value="${escapeHtml(scope)}"
+            checked
+          />
+          ${escapeHtml(scope)}
+        </label>
+      `
+    )
+    .join("<br>");
+
+  return `<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta
+    name="viewport"
+    content="width=device-width,initial-scale=1"
+  >
+  <title>
+    MLB WordPress Publisher
+  </title>
+</head>
+
+<body>
+  <main>
+    <h1>
+      アクセスを許可しますか？
+    </h1>
+
+    <p>
+      ${escapeHtml(clientName)}
+      が MLB WordPress Publisher
+      へのアクセスを要求しています。
+    </p>
+
+    <form
+      method="post"
+      action="/authorize"
+    >
+      <input
+        type="hidden"
+        name="handle"
+        value="${escapeHtml(handle)}"
+      />
+
+      <p>
+        ${scopeHtml}
+      </p>
+
+      <button
+        type="submit"
+        name="action"
+        value="allow"
+      >
+        許可
+      </button>
+
+      <button
+        type="submit"
+        name="action"
+        value="deny"
+      >
+        拒否
+      </button>
+    </form>
+  </main>
+</body>
+</html>`;
+}
+
+async function exchangeGithubCode(
+  env: Env,
+  code: string
+): Promise<string | null> {
+  const response = await fetch(
+    "https://github.com/login/oauth/access_token",
     {
-      description:
-        "Create a new WordPress post as a draft only. " +
-        "This tool cannot publish, schedule, update, or delete posts.",
+      method: "POST",
 
-      inputSchema: {
-        title: z
-          .string()
-          .min(1)
-          .describe("WordPress post title"),
+      headers: {
+        Accept: "application/json",
 
-        content: z
-          .string()
-          .min(1)
-          .describe("Final WordPress HTML content"),
-
-        excerpt: z
-          .string()
-          .optional()
-          .describe("Optional WordPress excerpt"),
-
-        slug: z
-          .string()
-          .optional()
-          .describe("Optional WordPress slug"),
+        "Content-Type":
+          "application/x-www-form-urlencoded",
       },
-    },
-    async ({
-      title,
-      content,
-      excerpt,
-      slug,
-    }) => {
-      const apiKey =
-        env.WORDPRESS_PUBLISHER_API_KEY ||
-        env.PUBLISHER_API_KEY;
 
-      if (!apiKey) {
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text:
-                "No WordPress publisher API key is configured. " +
-                "No WordPress request was sent.",
-            },
-          ],
-        };
-      }
+      body: new URLSearchParams({
+        client_id:
+          env.GITHUB_CLIENT_ID,
 
-      try {
-        const payload: Record<string, string> = {
-          title,
-          content,
-        };
+        client_secret:
+          env.GITHUB_CLIENT_SECRET,
 
-        if (excerpt) {
-          payload.excerpt = excerpt;
-        }
+        code,
 
-        if (slug) {
-          payload.slug = slug;
-        }
-
-        const response = await fetch(
-          PUBLISHER_URL,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type":
-                "application/json",
-              "X-API-Key":
-                apiKey,
-            },
-            body: JSON.stringify(payload),
-          }
-        );
-
-        const responseText =
-          await response.text();
-
-        if (!response.ok) {
-          return {
-            isError: true,
-            content: [
-              {
-                type: "text",
-                text:
-                  `WordPress draft creation failed. ` +
-                  `HTTP ${response.status}. ` +
-                  `The request was not retried automatically. ` +
-                  `Response: ${responseText}`,
-              },
-            ],
-          };
-        }
-
-        let result: {
-          success?: boolean;
-          id?: number;
-          status?: string;
-          link?: string;
-        };
-
-        try {
-          result = JSON.parse(responseText);
-        } catch {
-          return {
-            isError: true,
-            content: [
-              {
-                type: "text",
-                text:
-                  "The publisher returned an unexpected response. " +
-                  "The request was not retried automatically.",
-              },
-            ],
-          };
-        }
-
-        if (
-          result.status &&
-          result.status !== "draft"
-        ) {
-          return {
-            isError: true,
-            content: [
-              {
-                type: "text",
-                text:
-                  `Unexpected WordPress status: ${result.status}.`,
-              },
-            ],
-          };
-        }
-
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                {
-                  success: true,
-                  status: "draft",
-                  id: result.id,
-                  link: result.link,
-                },
-                null,
-                2
-              ),
-            },
-          ],
-        };
-      } catch (error) {
-        const message =
-          error instanceof Error
-            ? error.message
-            : String(error);
-
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text:
-                `WordPress draft creation failed: ${message}. ` +
-                `The request was not retried automatically.`,
-            },
-          ],
-        };
-      }
+        redirect_uri:
+          `${AUTH_ISSUER}/callback`,
+      }),
     }
   );
 
-  return server;
+  if (!response.ok) {
+    return null;
+  }
+
+  const data =
+    (await response.json()) as {
+      access_token?: string;
+    };
+
+  return data.access_token ?? null;
 }
 
-const mcpHandler = {
-  fetch(
-    request: Request,
-    env: Env,
-    ctx: ExecutionContext
-  ) {
-    return createMcpHandler(
-      createServer(env)
-    )(
-      request,
-      env,
-      ctx
+async function getGithubUser(
+  accessToken: string
+): Promise<{
+  id: number;
+  login: string;
+} | null> {
+  const response = await fetch(
+    "https://api.github.com/user",
+    {
+      headers: {
+        Authorization:
+          `Bearer ${accessToken}`,
+
+        Accept:
+          "application/vnd.github+json",
+
+        "User-Agent":
+          "mlb-wordpress-auth",
+      },
+    }
+  );
+
+  if (!response.ok) {
+    return null;
+  }
+
+  return (
+    await response.json()
+  ) as {
+    id: number;
+    login: string;
+  };
+}
+
+async function startGithubAuthorization(
+  authRequest: AuthRequest,
+  env: Env,
+  headers: Headers,
+  oauth: ReturnType<
+    OAuthAuthorizationServer<Env>[
+      "getOAuthApi"
+    ]
+  >
+): Promise<Response> {
+  const upstream =
+    await oauth.beginUpstream(
+      authRequest,
+      { headers }
     );
-  },
-};
 
-export default new OAuthResourceServer<
-  Env,
-  AuthProps
->({
-  resourceMetadata: {
-    resource: MCP_RESOURCE,
-    authorization_servers: [
-      AUTH_ISSUER,
-    ],
-  },
+  const githubUrl =
+    new URL(
+      "https://github.com/login/oauth/authorize"
+    );
 
-  requiredScopes: [
-    "mcp:read",
-    "mcp:write",
-  ],
+  githubUrl.searchParams.set(
+    "client_id",
+    env.GITHUB_CLIENT_ID
+  );
 
-  validateToken: (env) =>
-    env.AUTH_SERVER.validateToken,
+  githubUrl.searchParams.set(
+    "redirect_uri",
+    `${AUTH_ISSUER}/callback`
+  );
 
-  handler: mcpHandler,
-});
+  githubUrl.searchParams.set(
+    "state",
+    upstream.state
+  );
+
+  githubUrl.searchParams.set(
+    "scope",
+    "read:user user:email"
+  );
+
+  upstream.headers.set(
+    "Location",
+    githubUrl.toString()
+  );
+
+  return new Response(
+    null,
+    {
+      status: 302,
+      headers:
+        upstream.headers,
+    }
+  );
+}
+
+export default class AuthServer
+  extends WorkerEntrypoint<Env>
+{
+  async fetch(
+    request: Request
+  ): Promise<Response> {
+    const url =
+      new URL(request.url);
+
+    const oauth =
+      authorizationServer.getOAuthApi(
+        this.env
+      );
+
+    if (
+      url.pathname === "/authorize" &&
+      request.method === "GET"
+    ) {
+      const authRequest =
+        await oauth.parseAuthRequest(
+          request
+        );
+
+      const description =
+        await oauth.describeConsent(
+          authRequest
+        );
+
+      const consent =
+        await oauth.beginConsent(
+          authRequest
+        );
+
+      const html =
+        createConsentPage(
+          description.clientName,
+          description.scope,
+          consent.handle
+        );
+
+      const headers =
+        new Headers(
+          consent.headers
+        );
+
+      headers.set(
+        "Content-Type",
+        "text/html; charset=utf-8"
+      );
+
+      return new Response(
+        html,
+        {
+          status: 200,
+          headers,
+        }
+      );
+    }
+
+    if (
+      url.pathname === "/authorize" &&
+      request.method === "POST"
+    ) {
+      const form =
+        await request.formData();
+
+      const handle =
+        String(
+          form.get("handle") ?? ""
+        );
+
+      const action =
+        String(
+          form.get("action") ?? ""
+        );
+
+      if (!handle) {
+        return new Response(
+          "Missing consent handle",
+          {
+            status: 400,
+          }
+        );
+      }
+
+      if (action === "deny") {
+        const denied =
+          await oauth.denyConsent(
+            request,
+            handle
+          );
+
+        return new Response(
+          null,
+          {
+            status: 302,
+            headers:
+              denied.headers,
+          }
+        );
+      }
+
+      const scopes =
+        form
+          .getAll("scope")
+          .map(String);
+
+      const approved =
+        await oauth.approveConsent(
+          request,
+          handle,
+          {
+            scope: scopes,
+          }
+        );
+
+      return startGithubAuthorization(
+        approved.request,
+        this.env,
+        approved.headers,
+        oauth
+      );
+    }
+
+    if (
+      url.pathname === "/callback" &&
+      request.method === "GET"
+    ) {
+      const resumed =
+        await oauth.finishUpstream(
+          request
+        );
+
+      const code =
+        url.searchParams.get(
+          "code"
+        );
+
+      if (!code) {
+        return new Response(
+          "Missing GitHub authorization code",
+          {
+            status: 400,
+          }
+        );
+      }
+
+      const githubAccessToken =
+        await exchangeGithubCode(
+          this.env,
+          code
+        );
+
+      if (
+        !githubAccessToken
+      ) {
+        return new Response(
+          "GitHub token exchange failed",
+          {
+            status: 400,
+          }
+        );
+      }
+
+      const githubUser =
+        await getGithubUser(
+          githubAccessToken
+        );
+
+      if (!githubUser) {
+        return new Response(
+          "GitHub user lookup failed",
+          {
+            status: 400,
+          }
+        );
+      }
+
+      const completed =
+        await oauth
+          .completeAuthorization({
+            request:
+              resumed.request,
+
+            userId:
+              String(
+                githubUser.id
+              ),
+
+            metadata: {
+              provider:
+                "github",
+            },
+
+            scope:
+              resumed.request.scope,
+
+            props: {
+              githubLogin:
+                githubUser.login,
+            } satisfies AuthProps,
+          });
+
+      const headers =
+        new Headers(
+          resumed.headers
+        );
+
+      headers.set(
+        "Location",
+        completed.redirectTo
+      );
+
+      return new Response(
+        null,
+        {
+          status: 302,
+          headers,
+        }
+      );
+    }
+
+    return authorizationServer.fetch(
+      request,
+      this.env,
+      this.ctx
+    );
+  }
+
+  validateToken(
+    resource: string,
+    token: string
+  ) {
+    return authorizationServer
+      .validateToken(
+        resource,
+        token,
+        this.env
+      );
+  }
+}
