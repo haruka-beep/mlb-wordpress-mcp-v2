@@ -1,3 +1,4 @@
+// v2 deploy check 2026-10-05
 import { WorkerEntrypoint } from "cloudflare:workers";
 import {
   OAuthAuthorizationServer,
