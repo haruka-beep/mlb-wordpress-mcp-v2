@@ -1,0 +1,19 @@
+{
+  "name": "mlb-wordpress-mcp-v2",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "^1.0.0",
+    "@modelcontextprotocol/server": "^2.0.0",
+    "agents": "^0.20.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
