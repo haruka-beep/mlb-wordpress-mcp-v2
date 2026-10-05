@@ -1,4 +1,3 @@
-// trigger cloudflare deploy
 import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
 import {
@@ -13,8 +12,9 @@ type AuthProps = {
 
 interface Env {
   AUTH_SERVER: AuthorizationServerBinding<AuthProps>;
-  WORDPRESS_PUBLISHER_API_KEY: string;
-  PUBLISHER_API_KEY: string;
+
+  WORDPRESS_PUBLISHER_API_KEY?: string;
+  PUBLISHER_API_KEY?: string;
 }
 
 const MCP_RESOURCE =
@@ -36,39 +36,42 @@ function createServer(env: Env) {
     "publisher_runtime_probe_v2",
     {
       description:
-        "Check the v2 MCP runtime and publisher secret bindings. " +
-        "This tool does not create a WordPress post.",
+        "Check the v2 MCP runtime and WordPress publisher secret bindings. " +
+        "This tool does not create or modify any WordPress post.",
       inputSchema: {},
     },
-    async () => ({
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(
-            {
-              server: "mlb-wordpress-mcp-v2",
-              build: "2026-10-05-v2",
-              wordpress_publisher_api_key_configured:
-                Boolean(env.WORDPRESS_PUBLISHER_API_KEY),
-              publisher_api_key_configured:
-                Boolean(env.PUBLISHER_API_KEY),
-              mode: "draft-only",
-            },
-            null,
-            2
-          ),
-        },
-      ],
-    })
+    async () => {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                server: "mlb-wordpress-mcp-v2",
+                build: "2026-10-06-v2",
+                wordpress_publisher_api_key_configured: Boolean(
+                  env.WORDPRESS_PUBLISHER_API_KEY
+                ),
+                publisher_api_key_configured: Boolean(
+                  env.PUBLISHER_API_KEY
+                ),
+                mode: "draft-only",
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
   );
 
   server.registerTool(
     "create_wordpress_draft",
     {
       description:
-        "Create a new WordPress post as a draft only. " +
+        "Create a new WordPress post as draft only. " +
         "This tool cannot publish, schedule, update, or delete posts.",
-
       inputSchema: {
         title: z
           .string()
@@ -91,12 +94,7 @@ function createServer(env: Env) {
           .describe("Optional WordPress slug"),
       },
     },
-    async ({
-      title,
-      content,
-      excerpt,
-      slug,
-    }) => {
+    async ({ title, content, excerpt, slug }) => {
       const apiKey =
         env.WORDPRESS_PUBLISHER_API_KEY ||
         env.PUBLISHER_API_KEY;
@@ -115,34 +113,30 @@ function createServer(env: Env) {
         };
       }
 
+      const payload: Record<string, string> = {
+        title,
+        content,
+      };
+
+      if (excerpt) {
+        payload.excerpt = excerpt;
+      }
+
+      if (slug) {
+        payload.slug = slug;
+      }
+
       try {
-        const payload: Record<string, string> = {
-          title,
-          content,
-        };
+        const response = await fetch(PUBLISHER_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-API-Key": apiKey,
+          },
+          body: JSON.stringify(payload),
+        });
 
-        if (excerpt) {
-          payload.excerpt = excerpt;
-        }
-
-        if (slug) {
-          payload.slug = slug;
-        }
-
-        const response = await fetch(
-          PUBLISHER_URL,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "X-API-Key": apiKey,
-            },
-            body: JSON.stringify(payload),
-          }
-        );
-
-        const responseText =
-          await response.text();
+        const responseText = await response.text();
 
         if (!response.ok) {
           return {
@@ -247,7 +241,7 @@ const mcpHandler = {
     ctx: ExecutionContext
   ) {
     return createMcpHandler(
-      createServer(env)
+      () => createServer(env)
     )(
       request,
       env,
