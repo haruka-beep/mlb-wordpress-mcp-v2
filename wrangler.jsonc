@@ -1,0 +1,17 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "mlb-wordpress-mcp-v2",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-05",
+  "compatibility_flags": [
+    "nodejs_compat",
+    "global_fetch_strictly_public"
+  ],
+  "keep_vars": true,
+  "services": [
+    {
+      "binding": "AUTH_SERVER",
+      "service": "mlb-wordpress-auth"
+    }
+  ]
+}
